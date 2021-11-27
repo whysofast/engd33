@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include "task.h"
 #include "queue.h"
+#include "serial_uart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -76,7 +77,7 @@ void hedgehog_set_crc16(uint8_t *buf, uint8_t size);
 /* USER CODE BEGIN 0 */
 
 //  MARVELMIND HEDGEHOG RELATED PART BEGIN
-#define READY_RECEIVE_PATH_PIN 3
+//#define READY_RECEIVE_PATH_PIN 3
 
 //////////////////
 
@@ -91,11 +92,11 @@ void hedgehog_set_crc16(uint8_t *buf, uint8_t size);
 
 #define DATA_OFS 5
 
-int hedgehog_x, hedgehog_y;// coordinates of hedgehog (X,Y), cm
-int hedgehog_z;// height of hedgehog, cm
+int16_t hedgehog_x, hedgehog_y;// coordinates of hedgehog (X,Y), cm
+int16_t hedgehog_z;// height of hedgehog, cm
 uint8_t hedgehog_flags= 0;
 uint8_t hedgehog_address= 0;
-int hedgehog_pos_updated = 0;// flag of new data from hedgehog received
+int16_t hedgehog_pos_updated = 0;// flag of new data from hedgehog received
 
 #define HEDGEHOG_BUF_SIZE 64
 uint8_t hedgehog_serial_buf[HEDGEHOG_BUF_SIZE];
@@ -103,27 +104,28 @@ uint8_t hedgehog_serial_buf_ofs = 0;
 uint8_t hedgehog_packet_size;
 
 uint8_t hedgehog_packet_type;
-int hedgehog_packet_id = 0;
+int16_t hedgehog_packet_id = 0;
 
 HAL_UART_StateTypeDef UART_status2; // configuração da UART
 uint8_t UART_data_rx, UART_data_tx; // configuração da UART
+uint32_t TimeoutUART = 1; // tempo
 
-typedef union {uint8_t b[2]; unsigned int w;} uni_8x2_16;
+typedef union {uint8_t b[2]; uint16_t w;} uni_8x2_16;
 
 typedef struct {
   uint8_t moveType;
-  int param1;
-  int param2;
+  int16_t param1;
+  int16_t param2;
 } MoveItem;
 #define MAX_MOVE_ITEMS 64
 MoveItem moveItems[MAX_MOVE_ITEMS];
 uint8_t moveItemsNum= 0;
 
-unsigned long prevMoveItemShowTime= 0;
+uint32_t prevMoveItemShowTime= 0;
 uint8_t moveItemShowIndex= 0;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-void hedgehog_send_packet(uint8_t address, uint8_t packet_type, unsigned int id, uint8_t data_size)
+void hedgehog_send_packet(uint8_t address, uint8_t packet_type, uint16_t id, uint8_t data_size)
 {
    uint8_t frameSizeBeforeCRC;
 
@@ -145,9 +147,7 @@ void hedgehog_send_packet(uint8_t address, uint8_t packet_type, unsigned int id,
    }
 
    hedgehog_set_crc16(&hedgehog_serial_buf[0], frameSizeBeforeCRC);
-
-   //Serial.write(hedgehog_serial_buf, frameSizeBeforeCRC+2);
-   HAL_UART_Transmit_IT(&huart2, &hedgehog_serial_buf, frameSizeBeforeCRC+2);
+   Serial_Write(hedgehog_serial_buf, frameSizeBeforeCRC+2);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -157,8 +157,8 @@ void hedgehog_send_ready_confirm()
 {
   uint8_t status= 0;
 
-  UART_status2 = HAL_UART_GetState(&huart2); // estado de operação da UART
-  if(UART_status2 == HAL_UART_STATE_READY || UART_status2 == HAL_UART_STATE_BUSY_TX)
+  // estado de operação da UART
+  if( HAL_GPIO_ReadPin(READY_RECEIVE_PATH_PIN_GPIO_Port, READY_RECEIVE_PATH_PIN_Pin) == GPIO_PIN_RESET)
   {
 	  status|= (1<<0);// ready to receive data
   }
@@ -179,7 +179,7 @@ void restart_packet_receive()
    hedgehog_packet_id= 0;
 }
 
-int check_packet_data_size(uint8_t packet_type, unsigned int packet_id, uint8_t size, uint8_t wanted_size)
+int16_t check_packet_data_size(uint8_t packet_type, uint16_t packet_id, uint8_t size, uint8_t wanted_size)
 {
    if (hedgehog_packet_type == packet_type)
      if (hedgehog_packet_id == packet_id)
@@ -206,9 +206,9 @@ void process_stream_packet()
 {
    if (hedgehog_packet_id == HEDGEHOG_POS_PACKET_ID)
       {// packet of hedgehog position
-         hedgehog_x= atoi(hedgehog_serial_buf[9]) + (atoi(hedgehog_serial_buf[10])<<8);
-         hedgehog_y= atoi(hedgehog_serial_buf[11]) + (atoi(hedgehog_serial_buf[12])<<8);// coordinates of hedgehog (X,Y), cm
-         hedgehog_z= atoi(hedgehog_serial_buf[13]) + (atoi(hedgehog_serial_buf[14])<<8);// height of hedgehog, cm (FW V3.97+)
+         hedgehog_x= (int16_t)hedgehog_serial_buf[9] + (int16_t)((hedgehog_serial_buf[10])<<8);
+         hedgehog_y= (int16_t)hedgehog_serial_buf[11] + (int16_t)((hedgehog_serial_buf[12])<<8);// coordinates of hedgehog (X,Y), cm
+         hedgehog_z= (int16_t)hedgehog_serial_buf[13] + (int16_t)((hedgehog_serial_buf[14])<<8);// height of hedgehog, cm (FW V3.97+)
          hedgehog_flags= hedgehog_serial_buf[15];
          hedgehog_address= hedgehog_serial_buf[16];
          hedgehog_pos_updated= 1;// flag of new data from hedgehog received
@@ -234,8 +234,8 @@ void process_write_packet()
         if (indcur<moveItemsNum)
           {
             moveItems[indcur].moveType= hedgehog_serial_buf[5+0];
-            moveItems[indcur].param1= hedgehog_serial_buf[5+3] | (atoi(hedgehog_serial_buf[5+4])<<8);
-            moveItems[indcur].param2= hedgehog_serial_buf[5+5] | (atoi(hedgehog_serial_buf[5+6])<<8);
+            moveItems[indcur].param1= hedgehog_serial_buf[5+3] | (int16_t)((hedgehog_serial_buf[5+4])<<8);
+            moveItems[indcur].param2= hedgehog_serial_buf[5+5] | (int16_t)((hedgehog_serial_buf[5+6])<<8);
 
           }
 
@@ -248,16 +248,15 @@ void process_write_packet()
 
 // Marvelmind hedgehog service loop
 void loop_hedgehog()
-{int incoming_byte;
- int total_received_in_loop;
- int packet_received;
+{int16_t incoming_byte;
+ int16_t total_received_in_loop;
+ int16_t packet_received;
  //int packet_id;
  //int i,n,ofs;
 
   total_received_in_loop= 0;
   packet_received= 0;
-  UART_status2 = HAL_UART_GetState(&huart2); // estado de operação da UART
-  while(UART_status2 == HAL_UART_STATE_READY)
+  while(Serial_Available > 0) //Verificando se tem byter recebidos
   {
       if (hedgehog_serial_buf_ofs>=HEDGEHOG_BUF_SIZE)
         {
@@ -268,10 +267,7 @@ void loop_hedgehog()
       if (total_received_in_loop>100) break;// too much data without required header
 
       //incoming_byte = Serial.read();
-
-      HAL_UART_Receive_IT(&huart2, &UART_data_rx, 1);
-      incoming_byte = atoi(UART_data_rx);
-
+      incoming_byte = Serial_Read(); //Lendo o byte
       if (hedgehog_serial_buf_ofs==0)
         {// check first bytes for constant value
           if (incoming_byte != 0xff)
@@ -429,7 +425,7 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
+  Serial_begin(&huart2);  //Configurando para transmitir e recebervia uart
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -549,7 +545,7 @@ static void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
+  huart2.Init.BaudRate = 500000;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;
@@ -562,7 +558,7 @@ static void MX_USART2_UART_Init(void)
   }
   /* USER CODE BEGIN USART2_Init 2 */
   NVIC_SetPriority(USART2_IRQn,
-    		 NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 0, 0));
+    		NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 0, 0));
   NVIC_EnableIRQ(USART2_IRQn);
   /* USER CODE END USART2_Init 2 */
 
@@ -575,9 +571,17 @@ static void MX_USART2_UART_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+
+  /*Configure GPIO pin : READY_RECEIVE_PATH_PIN_Pin */
+  GPIO_InitStruct.Pin = READY_RECEIVE_PATH_PIN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(READY_RECEIVE_PATH_PIN_GPIO_Port, &GPIO_InitStruct);
 
 }
 
