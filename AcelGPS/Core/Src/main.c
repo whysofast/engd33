@@ -25,6 +25,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdint.h>
 #include <stdlib.h>
+#include "math.h"
 #include "task.h"
 #include "queue.h"
 #include "serial_uart.h"
@@ -47,6 +48,8 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c3;
+
 UART_HandleTypeDef huart2;
 
 /* Definitions for defaultTask */
@@ -64,17 +67,50 @@ const osThreadAttr_t defaultTask_attributes = {
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_I2C3_Init(void);
 void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 void task_UARTman( void *pvParameters );
 void hedgehog_send_write_answer_success(void);
 void hedgehog_set_crc16(uint8_t *buf, uint8_t size);
+QueueHandle_t xQueue_coord;
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+// variáveis do magnetômetro, bússula, módulo HMC5883L
+uint8_t adjst[2] = {0x01, 0x1D};
+uint8_t readMag[6];
+int16_t Mx, My, Mz;
+float bussMagRead, bussula;
+#define pi 3.14159
+
+// variáveis do acelerômetro e giroscópio, módulo MPU6050
+
+#define MPU6050_ADDR 0xD0
+#define SMPLRT_DIV_REG 0x19
+#define GYRO_CONFIG_REG 0x1B
+#define ACCEL_CONFIG_REG 0x1C
+#define ACCEL_XOUT_H_REG 0x3B
+#define TEMP_OUT_H_REG 0x41
+#define GYRO_XOUT_H_REG 0x43
+#define PWR_MGMT_1_REG 0x6B
+#define WHO_AM_I_REG 0x75
+
+
+int16_t Accel_X_RAW = 0;
+int16_t Accel_Y_RAW = 0;
+int16_t Accel_Z_RAW = 0;
+
+int16_t Gyro_X_RAW = 0;
+int16_t Gyro_Y_RAW = 0;
+int16_t Gyro_Z_RAW = 0;
+
+float Ax, Ay, Az, Gx, Gy, Gz;
+
 
 //  MARVELMIND HEDGEHOG RELATED PART BEGIN
 //#define READY_RECEIVE_PATH_PIN 3
@@ -213,6 +249,10 @@ void process_stream_packet()
          hedgehog_address= hedgehog_serial_buf[16];
          hedgehog_pos_updated= 1;// flag of new data from hedgehog received
 
+		 xQueueSend(xQueue_coord, &hedgehog_x, pdMS_TO_TICKS(1)); // deixa os dados de posição na fila
+		 xQueueSend(xQueue_coord, &hedgehog_y, pdMS_TO_TICKS(1));
+		 xQueueSend(xQueue_coord, &hedgehog_z, pdMS_TO_TICKS(1));
+
          if (hedgehog_flags&0x08)
           {// request for writing data
             hedgehog_send_ready_confirm();
@@ -247,137 +287,143 @@ void process_write_packet()
 //////////////////////////////////////////////////////////////////////////////////
 
 // Marvelmind hedgehog service loop
-void loop_hedgehog()
+//void loop_hedgehog()
+void task_UARTman( void *pvParameters ) // TASK DO SENSOR GPS
 {int16_t incoming_byte;
  int16_t total_received_in_loop;
  int16_t packet_received;
  //int packet_id;
  //int i,n,ofs;
 
-  total_received_in_loop= 0;
-  packet_received= 0;
-  while(Serial_Available > 0) //Verificando se tem byter recebidos
+  while(1)
   {
-      if (hedgehog_serial_buf_ofs>=HEDGEHOG_BUF_SIZE)
-        {
-          hedgehog_serial_buf_ofs= 0;
-          break;// buffer overflow
-        }
-      total_received_in_loop++;
-      if (total_received_in_loop>100) break;// too much data without required header
+	  total_received_in_loop= 0;
+	  packet_received= 0;
+	  while(Serial_Available() > 0) //Verificando se tem byter recebidos
+	  {
+		  if (hedgehog_serial_buf_ofs>=HEDGEHOG_BUF_SIZE)
+			{
+			  hedgehog_serial_buf_ofs= 0;
+			  break;// buffer overflow
+			}
+		  total_received_in_loop++;
+		  if (total_received_in_loop>100) break;// too much data without required header
 
-      //incoming_byte = Serial.read();
-      incoming_byte = Serial_Read(); //Lendo o byte
-      if (hedgehog_serial_buf_ofs==0)
-        {// check first bytes for constant value
-          if (incoming_byte != 0xff)
-            {
-              hedgehog_serial_buf_ofs= 0;// restart bufer fill
-              hedgehog_packet_id= 0;
-              continue;
-            }
-        }
-      else if (hedgehog_serial_buf_ofs==1)
-        {// check packet type
-          if ( (incoming_byte == PACKET_TYPE_STREAM_FROM_HEDGE) ||
-               (incoming_byte == PACKET_TYPE_READ_FROM_DEVICE) ||
-               (incoming_byte == PACKET_TYPE_WRITE_TO_DEVICE)
-             )
-            {// correct packet type - save
-              hedgehog_packet_type= incoming_byte;
-            }
-           else
-            {// incorrect packet type - skip packet
-              restart_packet_receive();
-              continue;
-            }
-        }
-      else if (hedgehog_serial_buf_ofs==3)
-        {// Check two-bytes packet ID
-          hedgehog_packet_id= hedgehog_serial_buf[2] + incoming_byte*256;
-          switch(hedgehog_packet_type)
-          {
-            case PACKET_TYPE_STREAM_FROM_HEDGE:
-              {
-                switch(hedgehog_packet_id)
-                  {
-                    case HEDGEHOG_POS_PACKET_ID:
-                      {
-                        break;
-                      }
+		  //incoming_byte = Serial.read();
+		  incoming_byte = Serial_Read(); //Lendo o byte
+		  if (hedgehog_serial_buf_ofs==0)
+			{// check first bytes for constant value
+			  if (incoming_byte != 0xff)
+				{
+				  hedgehog_serial_buf_ofs= 0;// restart bufer fill
+				  hedgehog_packet_id= 0;
+				  continue;
+				}
+			}
+		  else if (hedgehog_serial_buf_ofs==1)
+			{// check packet type
+			  if ( (incoming_byte == PACKET_TYPE_STREAM_FROM_HEDGE) ||
+				   (incoming_byte == PACKET_TYPE_READ_FROM_DEVICE) ||
+				   (incoming_byte == PACKET_TYPE_WRITE_TO_DEVICE)
+				 )
+				{// correct packet type - save
+				  hedgehog_packet_type= incoming_byte;
+				}
+			   else
+				{// incorrect packet type - skip packet
+				  restart_packet_receive();
+				  continue;
+				}
+			}
+		  else if (hedgehog_serial_buf_ofs==3)
+			{// Check two-bytes packet ID
+			  hedgehog_packet_id= hedgehog_serial_buf[2] + incoming_byte*256;
+			  switch(hedgehog_packet_type)
+			  {
+				case PACKET_TYPE_STREAM_FROM_HEDGE:
+				  {
+					switch(hedgehog_packet_id)
+					  {
+						case HEDGEHOG_POS_PACKET_ID:
+						  {
+							break;
+						  }
 
-                    default:
-                      {// incorrect packet ID - skip packet
-                        restart_packet_receive();
-                        continue;
-                      }
-                  }
-                break;
-              }
+						default:
+						  {// incorrect packet ID - skip packet
+							restart_packet_receive();
+							continue;
+						  }
+					  }
+					break;
+				  }
 
-              case PACKET_TYPE_WRITE_TO_DEVICE:
-              {
-                switch(hedgehog_packet_id)
-                  {
-                    case MOVEMENT_PATH_PACKET_ID:
-                      {
-                        break;
-                      }
+				  case PACKET_TYPE_WRITE_TO_DEVICE:
+				  {
+					switch(hedgehog_packet_id)
+					  {
+						case MOVEMENT_PATH_PACKET_ID:
+						  {
+							break;
+						  }
 
-                    default:
-                      {// incorrect packet ID - skip packet
-                        restart_packet_receive();
-                        continue;
-                      }
-                  }
-                break;
-              }
-          }
-        }
-    else if (hedgehog_serial_buf_ofs==4)
-      {// data field size
-        if (check_packet_data_size(PACKET_TYPE_STREAM_FROM_HEDGE, HEDGEHOG_POS_PACKET_ID, incoming_byte, 0x10) == 0)
-           continue;// incorrect hedgehog coordinates data size
+						default:
+						  {// incorrect packet ID - skip packet
+							restart_packet_receive();
+							continue;
+						  }
+					  }
+					break;
+				  }
+			  }
+			}
+		else if (hedgehog_serial_buf_ofs==4)
+		  {// data field size
+			if (check_packet_data_size(PACKET_TYPE_STREAM_FROM_HEDGE, HEDGEHOG_POS_PACKET_ID, incoming_byte, 0x10) == 0)
+			   continue;// incorrect hedgehog coordinates data size
 
-        if (check_packet_data_size(PACKET_TYPE_WRITE_TO_DEVICE, MOVEMENT_PATH_PACKET_ID, incoming_byte, 0x0c) == 0)
-           continue;// incorrect movement path packet data size
+			if (check_packet_data_size(PACKET_TYPE_WRITE_TO_DEVICE, MOVEMENT_PATH_PACKET_ID, incoming_byte, 0x0c) == 0)
+			   continue;// incorrect movement path packet data size
 
-         // save required packet size
-         hedgehog_packet_size= incoming_byte + 7;
-      }
+			 // save required packet size
+			 hedgehog_packet_size= incoming_byte + 7;
+		  }
 
-      hedgehog_serial_buf[hedgehog_serial_buf_ofs++]= incoming_byte;
-      if (hedgehog_serial_buf_ofs>5)
-       if (hedgehog_serial_buf_ofs == hedgehog_packet_size)
-        {// received packet with required header
-          packet_received= 1;
-          hedgehog_serial_buf_ofs= 0;// restart bufer fill
-          break;
-        }
-    }
+		  hedgehog_serial_buf[hedgehog_serial_buf_ofs++]= incoming_byte;
+		  if (hedgehog_serial_buf_ofs>5)
+		   if (hedgehog_serial_buf_ofs == hedgehog_packet_size)
+			{// received packet with required header
+			  packet_received= 1;
+			  hedgehog_serial_buf_ofs= 0;// restart bufer fill
+			  break;
+			}
+		}
 
 
-  if (packet_received)
-    {
-      hedgehog_set_crc16(&hedgehog_serial_buf[0], hedgehog_packet_size);// calculate CRC checksum of packet
-      if ((hedgehog_serial_buf[hedgehog_packet_size] == 0)&&(hedgehog_serial_buf[hedgehog_packet_size+1] == 0))
-        {// checksum success
-          switch(hedgehog_packet_type)
-          {
-            case PACKET_TYPE_STREAM_FROM_HEDGE:
-             {
-               process_stream_packet();
-               break;
-             }
+	  if (packet_received)
+		{
+		  hedgehog_set_crc16(&hedgehog_serial_buf[0], hedgehog_packet_size);// calculate CRC checksum of packet
+		  if ((hedgehog_serial_buf[hedgehog_packet_size] == 0)&&(hedgehog_serial_buf[hedgehog_packet_size+1] == 0))
+			{// checksum success
+			  switch(hedgehog_packet_type)
+			  {
+				case PACKET_TYPE_STREAM_FROM_HEDGE:
+				 {
+				   process_stream_packet();
+				   break;
+				 }
 
-            case PACKET_TYPE_WRITE_TO_DEVICE:
-             {
-               process_write_packet();
-               break;
-             }
-          }//switch
-        }
-    }// if (packet_received)
+				case PACKET_TYPE_WRITE_TO_DEVICE:
+				 {
+				   process_write_packet();
+				   break;
+				 }
+			  }//switch
+			}
+		}// if (packet_received)
+
+	  vTaskDelay(pdMS_TO_TICKS(10));
+	} //while
 }// loop_hedgehog
 
 //////////////////////////////////////////////////////////////////////////////////////
@@ -407,6 +453,115 @@ void hedgehog_set_crc16(uint8_t *buf, uint8_t size)
 }// hedgehog_set_crc16
 
 ////////////////////////////////////////////////  END OF MARVELMIND HEDGEHOG RELATED PART
+
+/// Funções do módulo  MPU6050 /////////////////////////////////////////////////////
+
+void MPU6050_Init (void)
+{
+	uint8_t check;
+	uint8_t Data;
+
+	// check device ID WHO_AM_I
+
+	HAL_I2C_Mem_Read (&hi2c3, MPU6050_ADDR,WHO_AM_I_REG,1, &check, 1, 1000);
+
+	if (check == 104)  // 0x68 will be returned by the sensor if everything goes well
+	{
+		// power management register 0X6B we should write all 0's to wake the sensor up
+		Data = 0;
+		HAL_I2C_Mem_Write(&hi2c3, MPU6050_ADDR, PWR_MGMT_1_REG, 1,&Data, 1, 1000);
+
+		// Set DATA RATE of 1KHz by writing SMPLRT_DIV register
+		Data = 0x07;
+		HAL_I2C_Mem_Write(&hi2c3, MPU6050_ADDR, SMPLRT_DIV_REG, 1, &Data, 1, 1000);
+
+		// Set accelerometer configuration in ACCEL_CONFIG Register
+		// XA_ST=0,YA_ST=0,ZA_ST=0, FS_SEL=0 -> � 2g
+		Data = 0x00;
+		HAL_I2C_Mem_Write(&hi2c3, MPU6050_ADDR, ACCEL_CONFIG_REG, 1, &Data, 1, 1000);
+
+		// Set Gyroscopic configuration in GYRO_CONFIG Register
+		// XG_ST=0,YG_ST=0,ZG_ST=0, FS_SEL=0 -> � 250 �/s
+		Data = 0x00;
+		HAL_I2C_Mem_Write(&hi2c3, MPU6050_ADDR, GYRO_CONFIG_REG, 1, &Data, 1, 1000);
+	}
+
+}
+
+
+void MPU6050_Read_Accel (void)
+{
+	uint8_t Rec_Data[6];
+
+	// Read 6 BYTES of data starting from ACCEL_XOUT_H register
+
+	HAL_I2C_Mem_Read (&hi2c3, MPU6050_ADDR, ACCEL_XOUT_H_REG, 1, Rec_Data, 6, 1000);
+
+	Accel_X_RAW = (int16_t)(Rec_Data[0] << 8 | Rec_Data [1]);
+	Accel_Y_RAW = (int16_t)(Rec_Data[2] << 8 | Rec_Data [3]);
+	Accel_Z_RAW = (int16_t)(Rec_Data[4] << 8 | Rec_Data [5]);
+
+	/*** convert the RAW values into acceleration in 'g'
+	     we have to divide according to the Full scale value set in FS_SEL
+	     I have configured FS_SEL = 0. So I am dividing by 16384.0
+	     for more details check ACCEL_CONFIG Register              ****/
+
+	Ax = Accel_X_RAW/16384.0;
+	Ay = Accel_Y_RAW/16384.0;
+	Az = Accel_Z_RAW/16384.0;
+}
+
+
+void MPU6050_Read_Gyro (void)
+{
+	uint8_t Rec_Data[6];
+
+	// Read 6 BYTES of data starting from GYRO_XOUT_H register
+
+	HAL_I2C_Mem_Read (&hi2c3, MPU6050_ADDR, GYRO_XOUT_H_REG, 1, Rec_Data, 6, 1000);
+
+	Gyro_X_RAW = (int16_t)(Rec_Data[0] << 8 | Rec_Data [1]);
+	Gyro_Y_RAW = (int16_t)(Rec_Data[2] << 8 | Rec_Data [3]);
+	Gyro_Z_RAW = (int16_t)(Rec_Data[4] << 8 | Rec_Data [5]);
+
+	/*** convert the RAW values into dps (�/s)
+	     we have to divide according to the Full scale value set in FS_SEL
+	     I have configured FS_SEL = 0. So I am dividing by 131.0
+	     for more details check GYRO_CONFIG Register              ****/
+
+	Gx = Gyro_X_RAW/131.0;
+	Gy = Gyro_Y_RAW/131.0;
+	Gz = Gyro_Z_RAW/131.0;
+}
+
+/////////////// FUNÇÕES DO MÓDULO HMC5883L ///////////////////////////////////////
+
+void HMC5883L_Init (void)
+{
+	HAL_I2C_Mem_Write(&hi2c3, 0x1A, 0x0B, 1, &adjst[0], 1, 100); //escreve nessas posições
+	HAL_I2C_Mem_Write(&hi2c3, 0x1A, 0x09, 1, &adjst[1], 1, 100);
+}
+
+void HMC5883L_Read_Mag (void)
+{
+	HAL_I2C_Mem_Read(&hi2c3, 0x1A, 0x06, 1, readMag, 1, 100);
+	if(readMag[0]&0x01)
+	{
+		HAL_I2C_Mem_Read(&hi2c3, 0x1A, 0x00, 1, readMag, 6, 100);
+		Mx = (readMag[1]<<8)|readMag[0];
+		My = (readMag[3]<<8)|readMag[2];
+		Mz = (readMag[5]<<8)|readMag[4];
+		bussula = atan2f(My, Mx)*180/pi;
+		if(bussula > 0)
+		{
+			bussMagRead = bussula;
+		}
+		else
+		{
+			bussMagRead = 360 + bussula;
+		}
+	}
+}
 /* USER CODE END 0 */
 
 /**
@@ -416,7 +571,6 @@ void hedgehog_set_crc16(uint8_t *buf, uint8_t size)
 int main(void)
 {
   /* USER CODE BEGIN 1 */
-  xTaskCreate(task_UARTman, "readwriteUART", 256, NULL, 1, NULL);
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -438,7 +592,14 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART2_UART_Init();
+  MX_I2C3_Init();
   /* USER CODE BEGIN 2 */
+  xQueue_coord = xQueueCreate( 3, sizeof( int16_t ) );
+
+  xTaskCreate(task_UARTman, "readwriteUART", 256, NULL, 1, NULL);
+
+  MPU6050_Init();
+  HMC5883L_Init();
 
   /* USER CODE END 2 */
 
@@ -485,6 +646,9 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	MPU6050_Read_Accel();
+	MPU6050_Read_Gyro();
+	HMC5883L_Read_Mag ();
 
   }
   /* USER CODE END 3 */
@@ -527,6 +691,40 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief I2C3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C3_Init(void)
+{
+
+  /* USER CODE BEGIN I2C3_Init 0 */
+
+  /* USER CODE END I2C3_Init 0 */
+
+  /* USER CODE BEGIN I2C3_Init 1 */
+
+  /* USER CODE END I2C3_Init 1 */
+  hi2c3.Instance = I2C3;
+  hi2c3.Init.ClockSpeed = 100000;
+  hi2c3.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c3.Init.OwnAddress1 = 0;
+  hi2c3.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c3.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c3.Init.OwnAddress2 = 0;
+  hi2c3.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c3.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C3_Init 2 */
+
+  /* USER CODE END I2C3_Init 2 */
+
 }
 
 /**
@@ -586,10 +784,6 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
-void task_UARTman( void *pvParameters )
-{
-}
 
 /* USER CODE END 4 */
 
