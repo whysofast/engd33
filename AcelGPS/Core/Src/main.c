@@ -28,6 +28,7 @@
 #include "math.h"
 #include "task.h"
 #include "queue.h"
+#include "semphr.h"
 #include "serial_uart.h"
 /* USER CODE END Includes */
 
@@ -71,10 +72,46 @@ static void MX_I2C3_Init(void);
 void StartDefaultTask(void *argument);
 
 /* USER CODE BEGIN PFP */
-void task_UARTman( void *pvParameters );
+float dt = 0.01;
+void PID_func (int16_t in, int16_t setpt, int16_t *udata, int16_t kp, int16_t ki, int16_t kd, float T);
 void hedgehog_send_write_answer_success(void);
 void hedgehog_set_crc16(uint8_t *buf, uint8_t size);
-QueueHandle_t xQueue_coord;
+static void iecompass(int16_t iBpx, int16_t iBpy, int16_t iBpz,int16_t iGpx, int16_t iGpy, int16_t iGpz);
+static int16_t iTrig(int16_t ix, int16_t iy);
+static int16_t iHundredAtan2Deg(int16_t iy, int16_t ix);
+static int16_t iHundredAtanDeg(int16_t iy, int16_t ix);
+static int16_t iDivide(int16_t iy, int16_t ix);
+void task_UARTman( void *pvParameters );
+void task_AcelGyr( void *pvParameters );
+void task_MagRot( void *pvParameters );
+void task_RobotPos( void *pvParameters );
+QueueHandle_t xQueue_GPS;
+QueueHandle_t xQueue_VelAng;
+QueueHandle_t xQueue_VelLin;
+QueueHandle_t xQueue_RotBase;
+QueueHandle_t xQueue_CampMag;
+QueueHandle_t xQueue_VelAux;
+QueueHandle_t xQueue_CampAux;
+QueueHandle_t xQueue_SetpointPos;
+QueueHandle_t xQueue_SetVelMot;
+QueueHandle_t xQueue_RotYaw;
+QueueHandle_t xQueue_XYref;
+SemaphoreHandle_t xSerial_semaphore; //semário a ser utilizado para o LCD e o HW290
+
+// Definição da Base Robótica
+#define L 1
+#define r 1
+#define alfa1 1
+#define alfa2 1
+#define alfa3 1
+
+//Coeficientes da matriz de cinemática direta
+#define sn1 -sin(alfa1)
+#define sn2 -sin(alfa2)
+#define sn3 -sin(alfa3)
+#define cs1 cos(alfa1)
+#define cs2 cos(alfa2)
+#define cs3 cos(alfa3)
 
 /* USER CODE END PFP */
 
@@ -83,8 +120,9 @@ QueueHandle_t xQueue_coord;
 
 // variáveis do magnetômetro, bússula, módulo HMC5883L
 uint8_t adjst[2] = {0x01, 0x1D};
+uint8_t bypass[2] = {0x02, 0x00};
 uint8_t readMag[6];
-int16_t Mx, My, Mz;
+int16_t Bx, By, Bz;
 float bussMagRead, bussula;
 #define pi 3.14159
 
@@ -100,7 +138,6 @@ float bussMagRead, bussula;
 #define PWR_MGMT_1_REG 0x6B
 #define WHO_AM_I_REG 0x75
 
-
 int16_t Accel_X_RAW = 0;
 int16_t Accel_Y_RAW = 0;
 int16_t Accel_Z_RAW = 0;
@@ -111,6 +148,20 @@ int16_t Gyro_Z_RAW = 0;
 
 float Ax, Ay, Az, Gx, Gy, Gz;
 
+// Variáveis de roll, pitch e yaw
+
+static int16_t iPhi, iThe, iPsi;
+/* magnetic field readings corrected for hard iron effects and PCB orientation */
+static int16_t iBfx, iBfy, iBfz;
+/* hard iron estimate */
+static int16_t iVx, iVy, iVz;
+
+/* fifth order of polynomial approximation giving 0.05 deg max error */
+const int16_t K1 = 5701;
+const int16_t K2 = -1645;
+const int16_t K3 = 446;
+const uint16_t MINDELTATRIG = 1; /* final step size for iTrig */
+const uint16_t MINDELTADIV = 1; /* final step size for iDivide */
 
 //  MARVELMIND HEDGEHOG RELATED PART BEGIN
 //#define READY_RECEIVE_PATH_PIN 3
@@ -229,7 +280,6 @@ int16_t check_packet_data_size(uint8_t packet_type, uint16_t packet_id, uint8_t 
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////
 
-
 // Sends answer on write request
 void hedgehog_send_write_answer_success(void)
 {
@@ -249,9 +299,12 @@ void process_stream_packet()
          hedgehog_address= hedgehog_serial_buf[16];
          hedgehog_pos_updated= 1;// flag of new data from hedgehog received
 
-		 xQueueSend(xQueue_coord, &hedgehog_x, pdMS_TO_TICKS(1)); // deixa os dados de posição na fila
-		 xQueueSend(xQueue_coord, &hedgehog_y, pdMS_TO_TICKS(1));
-		 xQueueSend(xQueue_coord, &hedgehog_z, pdMS_TO_TICKS(1));
+		 xQueueSend(xQueue_GPS, &hedgehog_x, pdMS_TO_TICKS(1)); // deixa os dados de posição na fila
+		 xQueueSend(xQueue_GPS, &hedgehog_y, pdMS_TO_TICKS(1));
+		 xQueueSend(xQueue_GPS, &hedgehog_z, pdMS_TO_TICKS(1));
+
+		 xQueueSend( xQueue_XYref,&hedgehog_x, pdMS_TO_TICKS(1)); // dados para cálculo
+		 xQueueSend( xQueue_XYref,&hedgehog_y, pdMS_TO_TICKS(1));
 
          if (hedgehog_flags&0x08)
           {// request for writing data
@@ -422,12 +475,11 @@ void task_UARTman( void *pvParameters ) // TASK DO SENSOR GPS
 			}
 		}// if (packet_received)
 
-	  vTaskDelay(pdMS_TO_TICKS(10));
+	  vTaskDelay(pdMS_TO_TICKS(100));
 	} //while
 }// loop_hedgehog
 
 //////////////////////////////////////////////////////////////////////////////////////
-
 
 // Calculate CRC-16 of hedgehog packet
 void hedgehog_set_crc16(uint8_t *buf, uint8_t size)
@@ -492,8 +544,10 @@ void MPU6050_Init (void)
 void MPU6050_Read_Accel (void)
 {
 	uint8_t Rec_Data[6];
-
+	uint8_t Data = 0;
 	// Read 6 BYTES of data starting from ACCEL_XOUT_H register
+
+	HAL_I2C_Mem_Write(&hi2c3, MPU6050_ADDR, PWR_MGMT_1_REG, 1,&Data, 1, 1000);
 
 	HAL_I2C_Mem_Read (&hi2c3, MPU6050_ADDR, ACCEL_XOUT_H_REG, 1, Rec_Data, 6, 1000);
 
@@ -509,14 +563,20 @@ void MPU6050_Read_Accel (void)
 	Ax = Accel_X_RAW/16384.0;
 	Ay = Accel_Y_RAW/16384.0;
 	Az = Accel_Z_RAW/16384.0;
+
+	xQueueSend(xQueue_VelLin, &Ax, pdMS_TO_TICKS(1)); // deixa os dados de velocidade linear na fila
+	xQueueSend(xQueue_VelLin, &Ay, pdMS_TO_TICKS(1));
+	xQueueSend(xQueue_VelLin, &Az, pdMS_TO_TICKS(1));
 }
 
 
 void MPU6050_Read_Gyro (void)
 {
 	uint8_t Rec_Data[6];
+	uint8_t Data = 0;
 
 	// Read 6 BYTES of data starting from GYRO_XOUT_H register
+	HAL_I2C_Mem_Write(&hi2c3, MPU6050_ADDR, PWR_MGMT_1_REG, 1,&Data, 1, 1000); //Desativa o Sleep Mode
 
 	HAL_I2C_Mem_Read (&hi2c3, MPU6050_ADDR, GYRO_XOUT_H_REG, 1, Rec_Data, 6, 1000);
 
@@ -532,6 +592,10 @@ void MPU6050_Read_Gyro (void)
 	Gx = Gyro_X_RAW/131.0;
 	Gy = Gyro_Y_RAW/131.0;
 	Gz = Gyro_Z_RAW/131.0;
+
+	xQueueSend(xQueue_VelAux, &Gx, pdMS_TO_TICKS(1)); // deixa os dados de velocidade Angular na fila
+	xQueueSend(xQueue_VelAux, &Gy, pdMS_TO_TICKS(1));
+	xQueueSend(xQueue_VelAux, &Gz, pdMS_TO_TICKS(1));
 }
 
 /////////////// FUNÇÕES DO MÓDULO HMC5883L ///////////////////////////////////////
@@ -544,14 +608,17 @@ void HMC5883L_Init (void)
 
 void HMC5883L_Read_Mag (void)
 {
+	HAL_I2C_Mem_Write(&hi2c3, MPU6050_ADDR, 0x37, 1, &bypass[0], 1, 100); // ativa o Pass-Through Mode
+	HAL_I2C_Mem_Write(&hi2c3, MPU6050_ADDR, 0x6A, 1, &bypass[1], 1, 100);
+
 	HAL_I2C_Mem_Read(&hi2c3, 0x1A, 0x06, 1, readMag, 1, 100);
 	if(readMag[0]&0x01)
 	{
 		HAL_I2C_Mem_Read(&hi2c3, 0x1A, 0x00, 1, readMag, 6, 100);
-		Mx = (readMag[1]<<8)|readMag[0];
-		My = (readMag[3]<<8)|readMag[2];
-		Mz = (readMag[5]<<8)|readMag[4];
-		bussula = atan2f(My, Mx)*180/pi;
+		Bx = (readMag[1]<<8)|readMag[0];
+		By = (readMag[3]<<8)|readMag[2];
+		Bz = (readMag[5]<<8)|readMag[4];
+		bussula = atan2f(By, Bx)*180/pi;
 		if(bussula > 0)
 		{
 			bussMagRead = bussula;
@@ -560,8 +627,317 @@ void HMC5883L_Read_Mag (void)
 		{
 			bussMagRead = 360 + bussula;
 		}
+
+		xQueueSend(xQueue_CampAux, &Bx, pdMS_TO_TICKS(1)); // deixa os dados de Campo na fila
+	    xQueueSend(xQueue_CampAux, &By, pdMS_TO_TICKS(1));
+	    xQueueSend(xQueue_CampAux, &Bz, pdMS_TO_TICKS(1));
 	}
 }
+
+///////////////////////// FUNÇÕES DE ROLL, PITCH e YAW //////////////////////////////////////////
+
+/* tilt-compensated e-Compass code */
+static void iecompass(int16_t iBpx, int16_t iBpy, int16_t iBpz,int16_t iGpx, int16_t iGpy, int16_t iGpz)
+{
+	/* stack variables */
+	/* iBpx, iBpy, iBpz: the three components of the magnetometer sensor */
+	/* iGpx, iGpy, iGpz: the three components of the accelerometer sensor */
+	/* local variables */
+	int16_t iSin, iCos; /* sine and cosine */
+	int32_t tmpAngle; /* temporary angle*100 deg: range -36000 to 36000 */
+	static int16_t iLPPhi, iLPThe, iLPPsi; /* low pass filtered angle*100 deg: range -18000 to 18000 */
+	static uint16_t ANGLE_LPF = 32768 /10; /* low pass filter: set to 32768 / N for N samples averaging */
+	/* subtract the hard iron offset */
+	iBpx -= iVx; /* see Eq 16 */
+	iBpy -= iVy; /* see Eq 16 */
+	iBpz -= iVz; /* see Eq 16 */
+
+	/* calculate current roll angle Phi */
+	iPhi = iHundredAtan2Deg(iGpy, iGpz);/* Eq 13 */
+
+	tmpAngle = (int32_t)iPhi - (int32_t)iLPPhi;
+	if (tmpAngle > 18000) tmpAngle -= 36000;
+	if (tmpAngle < -18000) tmpAngle += 36000;
+	/* calculate the new low pass filtered angle */
+	tmpAngle = (int32_t)iLPPhi + ((ANGLE_LPF * tmpAngle) >> 15);
+	/* check that the angle remains in -180 to 180 deg bounds */
+	if (tmpAngle > 18000) tmpAngle -= 36000;
+	if (tmpAngle < -18000) tmpAngle += 36000;
+	/* store the correctly bounded low pass filtered angle */
+	iLPPhi = (int16_t)tmpAngle;
+
+	/* calculate sin and cosine of roll angle Phi */
+	iSin = iTrig(iGpy, iGpz); /* Eq 13: sin = opposite / hypotenuse */
+	iCos = iTrig(iGpz, iGpy); /* Eq 13: cos = adjacent / hypotenuse */
+	/* de-rotate by roll angle Phi */
+	iBfy = (int16_t)((iBpy * iCos - iBpz * iSin) >> 15);/* Eq 19 y component */
+	iBpz = (int16_t)((iBpy * iSin + iBpz * iCos) >> 15);/* Bpy*sin(Phi)+Bpz*cos(Phi)*/
+	iGpz = (int16_t)((iGpy * iSin + iGpz * iCos) >> 15);/* Eq 15 denominator */
+	/* calculate current pitch angle Theta */
+	iThe = iHundredAtan2Deg((int16_t)-iGpx, iGpz);/* Eq 15 */
+	/* restrict pitch angle to range -90 to 90 degrees */
+	if (iThe > 9000) iThe = (int16_t) (18000 - iThe);
+	if (iThe < -9000) iThe = (int16_t) (-18000 - iThe);
+
+	tmpAngle = (int32_t)iThe - (int32_t)iLPThe;
+	if (tmpAngle > 18000) tmpAngle -= 36000;
+	if (tmpAngle < -18000) tmpAngle += 36000;
+	/* calculate the new low pass filtered angle */
+	tmpAngle = (int32_t)iLPThe + ((ANGLE_LPF * tmpAngle) >> 15);
+	if (tmpAngle > 9000) tmpAngle = (int16_t)(18000 - tmpAngle);
+	if (tmpAngle < -9000) tmpAngle = (int16_t)(-18000 - tmpAngle);
+	/* store the correctly bounded low pass filtered angle */
+	iLPThe = (int16_t)tmpAngle;
+
+	/* calculate sin and cosine of pitch angle Theta */
+	iSin = (int16_t)-iTrig(iGpx, iGpz); /* Eq 15: sin = opposite / hypotenuse */
+	iCos = iTrig(iGpz, iGpx); /* Eq 15: cos = adjacent / hypotenuse */
+	/* correct cosine if pitch not in range -90 to 90 degrees */
+	if (iCos < 0) iCos = (int16_t)-iCos;
+	/* de-rotate by pitch angle Theta */
+	iBfx = (int16_t)((iBpx * iCos + iBpz * iSin) >> 15); /* Eq 19: x component */
+	iBfz = (int16_t)((-iBpx * iSin + iBpz * iCos) >> 15);/* Eq 19: z component */
+	/* calculate current yaw = e-compass angle Psi */
+	iPsi = iHundredAtan2Deg((int16_t)-iBfy, iBfx); /* Eq 22 */
+
+	/* implement a modulo arithmetic exponential low pass filter on the yaw angle */
+	/* compute the change in angle modulo 360 degrees */
+	tmpAngle = (int32_t)iPsi - (int32_t)iLPPsi;
+	if (tmpAngle > 18000) tmpAngle -= 36000;
+	if (tmpAngle < -18000) tmpAngle += 36000;
+	/* calculate the new low pass filtered angle */
+	tmpAngle = (int32_t)iLPPsi + ((ANGLE_LPF * tmpAngle) >> 15);
+	/* check that the angle remains in -180 to 180 deg bounds */
+	if (tmpAngle > 18000) tmpAngle -= 36000;
+	if (tmpAngle < -18000) tmpAngle += 36000;
+	/* store the correctly bounded low pass filtered angle */
+	iLPPsi = (int16_t)tmpAngle;
+
+	xQueueSend(xQueue_RotBase, &iLPPhi, pdMS_TO_TICKS(1)); // deixa os dados de velocidade Angular na fila
+	xQueueSend(xQueue_RotBase, &iLPThe, pdMS_TO_TICKS(1));
+	xQueueSend(xQueue_RotBase, &iLPPsi, pdMS_TO_TICKS(1));
+	xQueueSend(xQueue_RotYaw, &iLPPsi, pdMS_TO_TICKS(1));
+}
+
+/* function to calculate ir = ix / sqrt(ix*ix+iy*iy) using binary division */
+static int16_t iTrig(int16_t ix, int16_t iy)
+{
+	uint32_t itmp; /* scratch */
+	uint32_t ixsq; /* ix * ix */
+	int16_t isignx; /* storage for sign of x. algorithm assumes x >= 0 then corrects later */
+	uint32_t ihypsq; /* (ix * ix) + (iy * iy) */
+	int16_t ir; /* result = ix / sqrt(ix*ix+iy*iy) range -1, 1 returned as signed Int16 */
+	int16_t idelta; /* delta on candidate result dividing each stage by factor of 2 */
+	/* stack variables */
+	/* ix, iy: signed 16 bit integers representing sensor reading in range -32768 to 32767 */
+	/* function returns signed Int16 as signed fraction (ie +32767=0.99997, -32768=-1.0000) */
+	/* algorithm solves for ir*ir*(ix*ix+iy*iy)=ix*ix */
+	/* correct for pathological case: ix==iy==0 */
+	if ((ix == 0) && (iy == 0)) ix = iy = 1;
+	/* check for -32768 which is not handled correctly */
+	if (ix == -32768) ix = -32767;
+	if (iy == -32768) iy = -32767;
+	/* store the sign for later use. algorithm assumes x is positive for convenience */
+	isignx = 1;
+	if (ix < 0)
+	{
+		ix = (int16_t)-ix;
+		isignx = -1;
+	}
+	/* for convenience in the boosting set iy to be positive as well as ix */
+	iy = (int16_t)abs(iy);
+	/* to reduce quantization effects, boost ix and iy but keep below maximum signed 16 bit */
+	while ((ix < 16384) && (iy < 16384))
+	{
+		ix = (int16_t)(ix + ix);
+		iy = (int16_t)(iy + iy);
+	}
+	/* calculate ix*ix and the hypotenuse squared */
+	ixsq = (uint32_t)(ix * ix); /* ixsq=ix*ix: 0 to 32767^2 = 1073676289 */
+	ihypsq = (uint32_t)(ixsq + iy * iy); /* ihypsq=(ix*ix+iy*iy) 0 to 2*32767*32767=2147352578 */
+	/* set result r to zero and binary search step to 16384 = 0.5 */
+	ir = 0;
+	idelta = 16384; /* set as 2^14 = 0.5 */
+	/* loop over binary sub-division algorithm */
+	do
+	{
+		/* generate new candidate solution for ir and test if we are too high or too low */
+		/* itmp=(ir+delta)^2, range 0 to 32767*32767 = 2^30 = 1073676289 */
+		itmp = (uint32_t)((ir + idelta) * (ir + idelta));
+		/* itmp=(ir+delta)^2*(ix*ix+iy*iy), range 0 to 2^31 = 2147221516 */
+		itmp = (itmp >> 15) * (ihypsq >> 15);
+		if (itmp <= ixsq) ir += idelta;
+			idelta = (int16_t)(idelta >> 1); /* divide by 2 using right shift one bit */
+	} while (idelta >= MINDELTATRIG); /* last loop is performed for idelta=MINDELTATRIG */
+	/* correct the sign before returning */
+	return (int16_t)(ir * isignx);
+}
+
+/* calculates 100*atan2(iy/ix)=100*atan2(iy,ix) in deg for ix, iy in range -32768 to 32767 */
+static int16_t iHundredAtan2Deg(int16_t iy, int16_t ix)
+{
+	int16_t iResult; /* angle in degrees times 100 */
+	/* check for -32768 which is not handled correctly */
+	if (ix == -32768) ix = -32767;
+	if (iy == -32768) iy = -32767;
+	/* check for quadrants */
+	if ((ix >= 0) && (iy >= 0)) /* range 0 to 90 degrees */
+	iResult = iHundredAtanDeg(iy, ix);
+	else if ((ix <= 0) && (iy >= 0)) /* range 90 to 180 degrees */
+	iResult = (int16_t)(18000 - (int16_t)iHundredAtanDeg(iy, (int16_t)-ix));
+	else if ((ix <= 0) && (iy <= 0)) /* range -180 to -90 degrees */
+	iResult = (int16_t)((int16_t)-18000 + iHundredAtanDeg((int16_t)-iy, (int16_t)-ix));
+	else /* ix >=0 and iy <= 0 giving range -90 to 0 degrees */
+	iResult = (int16_t)(-iHundredAtanDeg((int16_t)-iy, ix));
+	return (iResult);
+}
+
+/* calculates 100*atan(iy/ix) range 0 to 9000 for all ix, iy positive in range 0 to 32767 */
+static int16_t iHundredAtanDeg(int16_t iy, int16_t ix)
+{
+	int32_t iAngle; /* angle in degrees times 100 */
+	int16_t iRatio; /* ratio of iy / ix or vice versa */
+	int32_t iTmp; /* temporary variable */
+	/* check for pathological cases */
+	if ((ix == 0) && (iy == 0)) return (0);
+	if ((ix == 0) && (iy != 0)) return (9000);
+	/* check for non-pathological cases */
+	if (iy <= ix)
+		iRatio = iDivide(iy, ix); /* return a fraction in range 0. to 32767 = 0. to 1. */
+	else
+		iRatio = iDivide(ix, iy); /* return a fraction in range 0. to 32767 = 0. to 1. */
+	/* first, third and fifth order polynomial approximation */
+	iAngle = (int32_t) K1 * (int32_t) iRatio;
+	iTmp = ((int32_t) iRatio >> 5) * ((int32_t) iRatio >> 5) * ((int32_t) iRatio >> 5);
+	iAngle += (iTmp >> 15) * (int32_t) K2;
+	iTmp = (iTmp >> 20) * ((int32_t) iRatio >> 5) * ((int32_t) iRatio >> 5);
+	iAngle += (iTmp >> 15) * (int32_t) K3;
+	iAngle = iAngle >> 15;
+	/* check if above 45 degrees */
+	if (iy > ix) iAngle = (int16_t)(9000 - iAngle);
+	/* for tidiness, limit result to range 0 to 9000 equals 0.0 to 90.0 degrees */
+	if (iAngle < 0) iAngle = 0;
+	if (iAngle > 9000) iAngle = 9000;
+	return ((int16_t) iAngle);
+}
+
+/* function to calculate ir = iy / ix with iy <= ix, and ix, iy both > 0 */
+static int16_t iDivide(int16_t iy, int16_t ix)
+{
+	int16_t itmp; /* scratch */
+	int16_t ir; /* result = iy / ix range 0., 1. returned in range 0 to 32767 */
+	int16_t idelta; /* delta on candidate result dividing each stage by factor of 2 */
+	/* set result r to zero and binary search step to 16384 = 0.5 */
+	ir = 0;
+	idelta = 16384; /* set as 2^14 = 0.5 */
+	/* to reduce quantization effects, boost ix and iy to the maximum signed 16 bit value */
+	while ((ix < 16384) && (iy < 16384))
+	{
+		ix = (int16_t)(ix + ix);
+		iy = (int16_t)(iy + iy);
+	}
+	/* loop over binary sub-division algorithm solving for ir*ix = iy */
+	do
+	{
+		/* generate new candidate solution for ir and test if we are too high or too low */
+		itmp = (int16_t)(ir + idelta); /* itmp=ir+delta, the candidate solution */
+		itmp = (int16_t)((itmp * ix) >> 15);
+		if (itmp <= iy) ir += idelta;
+		idelta = (int16_t)(idelta >> 1); /* divide by 2 using right shift one bit */
+	} while (idelta >= MINDELTADIV); /* last loop is performed for idelta=MINDELTADIV */
+	return (ir);
+}
+
+//////////////////////////////////////////////////////
+
+void PID_func (int16_t in, int16_t setpt, int16_t *udata, int16_t kp, int16_t ki, int16_t kd, float T)
+{
+	float er = 0;
+	er = setpt - in;
+	udata[0] = udata[1] + kp*(er - udata[2]) + ki*T*er + (kd/T)*(er - 2*udata[2] - udata[3]);
+	udata[1] = udata[0];
+	udata[3] = udata[2];
+	udata[2] = er;
+}
+
+///// TAREFA PARA MANIPULA O ACELERÔMETRO E GIROSCÓPIO
+void task_AcelGyr( void *pvParameters )
+{
+	while(1)
+	{
+		xSemaphoreTake(xSerial_semaphore, pdMS_TO_TICKS(3)); //pega o controle do I2C
+		MPU6050_Read_Accel();
+		MPU6050_Read_Gyro();
+		xSemaphoreGive(xSerial_semaphore); //libera o controle do I2C
+		vTaskDelay(pdMS_TO_TICKS(10));
+	}
+
+}
+
+///////////////////////////////////////////////////////
+
+void task_MagRot( void *pvParameters )
+{
+	int16_t Bx1, By1, Bz1;
+	float Gx1, Gy1, Gz1;
+	while(1)
+	{
+		xSemaphoreTake(xSerial_semaphore, pdMS_TO_TICKS(3)); //pega o controle do I2C
+		HMC5883L_Read_Mag ();
+		xSemaphoreGive(xSerial_semaphore); //libera o controle do I2C
+		xQueueReceive(xQueue_VelAux, &Gx1, pdMS_TO_TICKS(1)); // recebe os dados de velocidade Angular na fila
+		xQueueReceive(xQueue_VelAux, &Gy1, pdMS_TO_TICKS(1));
+		xQueueReceive(xQueue_VelAux, &Gz1, pdMS_TO_TICKS(1));
+
+		xQueueReceive(xQueue_CampAux, &Bx1, pdMS_TO_TICKS(1)); // recebe os dados de velocidade Angular na fila
+		xQueueReceive(xQueue_CampAux, &By1, pdMS_TO_TICKS(1));
+		xQueueReceive(xQueue_CampAux, &Bz1, pdMS_TO_TICKS(1));
+
+		iecompass(Bx1, By1, Bz1, (int16_t)Gx1, (int16_t)Gy1, (int16_t)Gz1);
+
+		vTaskDelay(pdMS_TO_TICKS(10));
+	}
+}
+
+
+////////////////////////////////////////////////////////
+void task_RobotPos( void *pvParameters )
+{
+	static int16_t yaw, Xgps, Ygps, Xst, Yst, YawSt;
+	int16_t Kp[3] = {1, 1, 1};
+	int16_t Ki[3] = {1, 1, 1};
+	int16_t Kd[3] = {1, 1, 1};
+	int16_t ref1[3], ref2[3], ref3[3];
+	float w1, w2, w3;
+
+	while(1)
+	{
+		xQueueReceive(xQueue_XYref,&Xgps, pdMS_TO_TICKS(1)); // valores lidos
+		xQueueReceive(xQueue_XYref,&Ygps, pdMS_TO_TICKS(1));
+		xQueueReceive(xQueue_RotYaw, &yaw, pdMS_TO_TICKS(1));
+
+		xQueueReceive(xQueue_SetpointPos, &Xst, pdMS_TO_TICKS(1)); // setpoints
+		xQueueReceive(xQueue_SetpointPos, &Yst, pdMS_TO_TICKS(1));
+		xQueueReceive(xQueue_SetpointPos, &YawSt, pdMS_TO_TICKS(1));
+
+		PID_func (Xgps, Xst, ref1, Kp[0], Ki[0], Kd[0], dt);
+		PID_func (Ygps, Yst, ref2, Kp[1], Ki[1], Kd[1], dt);
+		PID_func (yaw, YawSt, ref3, Kp[2], Ki[2], Kd[2], dt);
+
+		w1 = (1/r)*(sn1*ref1[0] + cs1*ref2[0] + L*ref3[0]); // cálculo matricial das velocidades angulares
+		w2 = (1/r)*(sn2*ref1[0] + cs2*ref2[0] + L*ref3[0]);
+		w3 = (1/r)*(sn3*ref1[0] + cs3*ref2[0] + L*ref3[0]);
+
+		xQueueSend(xQueue_SetVelMot, &w1, pdMS_TO_TICKS(1));
+		xQueueSend(xQueue_SetVelMot, &w2, pdMS_TO_TICKS(1));
+		xQueueSend(xQueue_SetVelMot, &w3, pdMS_TO_TICKS(1));
+
+		vTaskDelay(pdMS_TO_TICKS(10));
+	}
+}
+/////////////////////////////// PID control W1,W2,W3///////////////////////
+
+
 /* USER CODE END 0 */
 
 /**
@@ -594,9 +970,24 @@ int main(void)
   MX_USART2_UART_Init();
   MX_I2C3_Init();
   /* USER CODE BEGIN 2 */
-  xQueue_coord = xQueueCreate( 3, sizeof( int16_t ) );
+  xQueue_GPS = xQueueCreate( 3, sizeof( int16_t ) );
+  xQueue_VelAng = xQueueCreate( 3, sizeof( float ) );
+  xQueue_VelLin = xQueueCreate( 3, sizeof( float ) );
+  xQueue_RotBase = xQueueCreate( 3, sizeof( int16_t ) );
+  xQueue_CampMag = xQueueCreate( 3, sizeof( int16_t ) );
+  xQueue_VelAux = xQueueCreate( 3, sizeof( float ) );
+  xQueue_CampAux = xQueueCreate( 3, sizeof( int16_t ) );
+  xQueue_SetpointPos = xQueueCreate( 3, sizeof( int16_t ) ); // poses: {x, y, teta}
+  xQueue_SetVelMot = xQueueCreate( 3, sizeof( float ) ); // velocidade: {w1, w2, w3}
+  xQueue_RotYaw = xQueueCreate( 1, sizeof( int16_t ) );
+  xQueue_XYref = xQueueCreate( 2, sizeof( int16_t ) );
 
-  xTaskCreate(task_UARTman, "readwriteUART", 256, NULL, 1, NULL);
+  xSerial_semaphore = xSemaphoreCreateMutex();
+
+  xTaskCreate(task_UARTman, "readwriteUART", 128, NULL, 1, NULL);
+  xTaskCreate(task_AcelGyr, "readAcelGyr", 128, NULL, 1, NULL);
+  xTaskCreate(task_MagRot, "readMagRot", 128, NULL, 1, NULL);
+  xTaskCreate(task_RobotPos, "RobotPosition", 128, NULL, 1, NULL);
 
   MPU6050_Init();
   HMC5883L_Init();
@@ -646,9 +1037,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	MPU6050_Read_Accel();
-	MPU6050_Read_Gyro();
-	HMC5883L_Read_Mag ();
 
   }
   /* USER CODE END 3 */
@@ -670,10 +1058,14 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 168;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -682,12 +1074,12 @@ void SystemClock_Config(void)
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
   {
     Error_Handler();
   }
@@ -773,6 +1165,7 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin : READY_RECEIVE_PATH_PIN_Pin */
@@ -784,7 +1177,13 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/*xQueueSend(xQueue_VelAng, &Gx, pdMS_TO_TICKS(1)); // deixa os dados de velocidade Angular na fila
+	xQueueSend(xQueue_VelAng, &Gy, pdMS_TO_TICKS(1));
+	xQueueSend(xQueue_VelAng, &Gz, pdMS_TO_TICKS(1));
 
+	xQueueSend(xQueue_CampMag, &Bx, pdMS_TO_TICKS(1)); // deixa os dados de Campo na fila
+	xQueueSend(xQueue_CampMag, &By, pdMS_TO_TICKS(1));
+	xQueueSend(xQueue_CampMag, &Bz, pdMS_TO_TICKS(1));*/
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
