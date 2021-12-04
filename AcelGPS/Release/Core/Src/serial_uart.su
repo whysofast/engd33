@@ -1,0 +1,6 @@
+serial_uart.c:32:6:Serial_begin	8	static
+serial_uart.c:47:6:Serial_end	8	static,ignoring_inline_asm
+serial_uart.c:64:10:Serial_Available	0	static,ignoring_inline_asm
+serial_uart.c:81:9:Serial_Read	0	static,ignoring_inline_asm
+serial_uart.c:100:6:Serial_Write	0	static
+serial_uart.c:114:6:HAL_UART_RxCpltCallback	4	static
