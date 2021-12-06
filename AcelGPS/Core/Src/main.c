@@ -536,6 +536,9 @@ void MPU6050_Init (void)
 		// XG_ST=0,YG_ST=0,ZG_ST=0, FS_SEL=0 -> � 250 �/s
 		Data = 0x00;
 		HAL_I2C_Mem_Write(&hi2c3, MPU6050_ADDR, GYRO_CONFIG_REG, 1, &Data, 1, 1000);
+
+		HAL_I2C_Mem_Write(&hi2c3, MPU6050_ADDR, 0x37, 1, &bypass[0], 1, 100); // ativa o Pass-Through Mode
+		HAL_I2C_Mem_Write(&hi2c3, MPU6050_ADDR, 0x6A, 1, &bypass[1], 1, 100);
 	}
 
 }
@@ -608,9 +611,6 @@ void HMC5883L_Init (void)
 
 void HMC5883L_Read_Mag (void)
 {
-	HAL_I2C_Mem_Write(&hi2c3, MPU6050_ADDR, 0x37, 1, &bypass[0], 1, 100); // ativa o Pass-Through Mode
-	HAL_I2C_Mem_Write(&hi2c3, MPU6050_ADDR, 0x6A, 1, &bypass[1], 1, 100);
-
 	HAL_I2C_Mem_Read(&hi2c3, 0x1A, 0x06, 1, readMag, 1, 100);
 	if(readMag[0]&0x01)
 	{
@@ -865,10 +865,12 @@ void task_AcelGyr( void *pvParameters )
 {
 	while(1)
 	{
-		xSemaphoreTake(xSerial_semaphore, pdMS_TO_TICKS(3)); //pega o controle do I2C
-		MPU6050_Read_Accel();
-		MPU6050_Read_Gyro();
-		xSemaphoreGive(xSerial_semaphore); //libera o controle do I2C
+		if( xSemaphoreTake(xSerial_semaphore,pdMS_TO_TICKS(3)) == pdTRUE ) //pega o controle do I2C
+		{
+			MPU6050_Read_Accel();
+			MPU6050_Read_Gyro();
+			xSemaphoreGive(xSerial_semaphore); //libera o controle do I2C
+		}
 		vTaskDelay(pdMS_TO_TICKS(10));
 	}
 
@@ -882,9 +884,11 @@ void task_MagRot( void *pvParameters )
 	float Gx1, Gy1, Gz1;
 	while(1)
 	{
-		xSemaphoreTake(xSerial_semaphore, pdMS_TO_TICKS(3)); //pega o controle do I2C
-		HMC5883L_Read_Mag ();
-		xSemaphoreGive(xSerial_semaphore); //libera o controle do I2C
+		if( xSemaphoreTake(xSerial_semaphore,pdMS_TO_TICKS(3)) == pdTRUE ) //pega o controle do I2C
+		{
+			HMC5883L_Read_Mag ();
+			xSemaphoreGive(xSerial_semaphore); //libera o controle do I2C
+		}
 		xQueueReceive(xQueue_VelAux, &Gx1, pdMS_TO_TICKS(1)); // recebe os dados de velocidade Angular na fila
 		xQueueReceive(xQueue_VelAux, &Gy1, pdMS_TO_TICKS(1));
 		xQueueReceive(xQueue_VelAux, &Gz1, pdMS_TO_TICKS(1));
@@ -907,7 +911,7 @@ void task_RobotPos( void *pvParameters )
 	int16_t Kp[3] = {1, 1, 1};
 	int16_t Ki[3] = {1, 1, 1};
 	int16_t Kd[3] = {1, 1, 1};
-	int16_t ref1[3], ref2[3], ref3[3];
+	int16_t ref1[4], ref2[4], ref3[4];
 	float w1, w2, w3;
 
 	while(1)
@@ -955,7 +959,7 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-  Serial_begin(&huart2);  //Configurando para transmitir e recebervia uart
+
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -991,7 +995,7 @@ int main(void)
 
   MPU6050_Init();
   HMC5883L_Init();
-
+  Serial_begin(&huart2);  //Configurando para transmitir e recebervia uart
   /* USER CODE END 2 */
 
   /* Init scheduler */
